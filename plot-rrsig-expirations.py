@@ -17,7 +17,7 @@ And you can pipe that input to the program directly:
 
 """
 
-import os, sys, getopt
+import os, sys, getopt, math
 from datetime import datetime, timedelta
 from collections import OrderedDict
 import numpy as np
@@ -94,14 +94,18 @@ def process_args(arguments):
         return
 
 
+def getDaysLeft(rrsigExpire):
+    e = datetime.strptime(rrsigExpire, SIG_TIMESTAMP_FORMAT)
+    days_left = (e - datetime.now()).total_seconds() / 86400.0
+    return math.floor(days_left + 0.5)
+
+
 def getExpirationDict():
     counts = dict()
     for line in sys.stdin:
         parts = line.split()
         if parts[3] == 'RRSIG':
-            sig_expiration = datetime.strptime(parts[8],
-                                               SIG_TIMESTAMP_FORMAT)
-            days_left = (sig_expiration - datetime.now()).days
+            days_left = getDaysLeft(parts[8])
             counts[days_left] = counts.get(days_left, 0) + 1
     orderedCounts = OrderedDict(sorted(counts.items()))
     return orderedCounts
@@ -112,9 +116,7 @@ def getExpirationCounts():
     for line in sys.stdin:
         parts = line.split()
         if parts[3] == 'RRSIG':
-            sig_expiration = datetime.strptime(parts[8],
-                                               SIG_TIMESTAMP_FORMAT)
-            days_left = (sig_expiration - datetime.now()).days
+            days_left = getDaysLeft(parts[8])
             expirations.append(days_left)
     return expirations
 
