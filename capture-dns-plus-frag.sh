@@ -1,5 +1,10 @@
 #!/bin/sh
 #
+# Small script that uses tcpdump to capture DNS packets continuously
+# to a set of output files. It captures both UDP and TCP packets. And
+# also non-initial UDP fragments for large DNS messages that resulted
+# in IP fragmentation.
+#
 # Limitations: tcpdump (as far as I can tell) can't do stateful packet
 # capture, so we can't surgically capture only subsequent fragments of a DNS
 # message. So we just capture all non-initial fragments. This is potentially
@@ -14,7 +19,7 @@
 # fragment header is not the first of the extension headers in an IPv6
 # packet. But it usually is. Precisely capturing fragment headers in possibly
 # arbitrary positions in an extension header chain probably requires a more
-# sophisticated tool that tcpdump. The following pcap expression is used:
+# sophisticated tool than tcpdump. The following pcap expression is used:
 # 'ip6[6] == 44'
 #
 # So the complete pcap expression is the following:
@@ -45,11 +50,13 @@
 # 
 #      sudo nohup capture-dns-plus-frag.sh /usr/local/bind/capture/log.pcap &
 #
+# Author: Shumon Huque
+#
 
-USERNAME=named
-SNAPLEN=0
-NUMFILES=5                                          # -W: number of files
-FILESIZE=100                                        # -C: filesize in MB
+USERNAME=named                               # user to drop privileges to
+SNAPLEN=0                                    # capture size (0 = full packet)
+NUMFILES=5                                   # -W: max number of files
+FILESIZE=100                                 # -C: max filesize in MB
 
 OUTPUT=${1:-"out.pcap"}
 echo Capturing packets to file: $OUTPUT
