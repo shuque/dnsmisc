@@ -61,6 +61,5 @@ FILESIZE=100                                 # -C: max filesize in MB
 OUTPUT=${1:-"out.pcap"}
 echo Capturing packets to file: $OUTPUT
 
-tcpdump -s $SNAPLEN -Z $USERNAME -w $OUTPUT -W $NUMFILES -C $FILESIZE \
-	port 53 or \('ip[6:2] & 0x1fff != 0'\) or \('ip6[6] == 44'\)
-
+exec tcpdump -s $SNAPLEN -Z $USERNAME -w $OUTPUT -W $NUMFILES -C $FILESIZE \
+     port 53 or \('ip[6:2] & 0x1fff != 0'\) or \('ip6[6] == 44'\)

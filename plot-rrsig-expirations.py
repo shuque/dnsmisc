@@ -19,7 +19,7 @@ And you can pipe that input to the program directly:
 
 import os, sys, getopt, math
 from datetime import datetime, timedelta
-from collections import OrderedDict
+from collections import defaultdict, OrderedDict
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
@@ -101,12 +101,12 @@ def getDaysLeft(rrsigExpire):
 
 
 def getExpirationDict():
-    counts = dict()
+    counts = defaultdict(int)
     for line in sys.stdin:
         parts = line.split()
         if parts[3] == 'RRSIG':
             days_left = getDaysLeft(parts[8])
-            counts[days_left] = counts.get(days_left, 0) + 1
+            counts[days_left] += 1
     orderedCounts = OrderedDict(sorted(counts.items()))
     return orderedCounts
 
