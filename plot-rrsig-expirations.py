@@ -43,16 +43,21 @@ def usage(msg=None):
     if msg:
         print("{}\n".format(msg))
     print("""\
-Usage: {} [Options] [<outfile>]
+Usage: {0} [Options] [<outfile>]
 
        Options:
+       --help           Print this help message and exit
        --line           Create a line plot (this is the default)
        --histo          Create a histogram plot
-       --out=<file>     Output file (default is {})
+       --out=<file>     Output file (default is {1})
+       --title=<title>  Use specified title above the graph
 
-Reads a presentation format DNS zonefile form standard input, one RR per
+Reads a presentation format DNS zonefile from standard input, one RR per
 line, and then produces a plot of signature expiration times (in days),
 writing the output to a file.
+
+Input suitable for this program can be generated with dig, e.g.
+dig @<ip> +nocmd +nostats +onesoa <zone> AXFR | {0}
 """.format(PROGNAME, DEFAULT_OUTFILE))
     sys.exit(1)
 
@@ -67,7 +72,6 @@ def process_args(arguments):
         "histo",
         "out=",
         "title=",
-        "verbose",
     ]
     try:
         (options, args) = getopt.getopt(arguments, "", longopts=longopts)
@@ -75,9 +79,7 @@ def process_args(arguments):
         usage(e)
 
     for (opt, optval) in options:
-        if opt == "--verbose":
-            Opts.verbose = True
-        elif opt == "--help":
+        if opt == "--help":
             usage()
         elif opt == "--line":
             Opts.plot_type = "line"
