@@ -48,9 +48,7 @@ def nsec3hash(name, algnum, salt, iterations, binary_out=False):
     hashfunc = hashalg(algnum)
     digest = wire_name
     while (iterations >= 0):
-        s = hashfunc()
-        s.update(digest + wire_salt)
-        digest = s.digest()
+        digest = hashfunc(digest + wire_salt).digest()
         iterations -= 1
     if binary_out:
         return digest
