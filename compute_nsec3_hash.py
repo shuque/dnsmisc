@@ -1,20 +1,5 @@
 #!/usr/bin/env python3
 
-"""
-
-Test Values:
-
-$ nsec3hash 9EBA4228 1 0 appforce.com.
-8J1MO1GNFAB00QV63ROFSL7DBDQU0QN2 (salt=9EBA4228, hash=1, iterations=0)
-
-$ nsec3hash 4AB238F7CD74D23D 1 50 toshiba.com.
-7QN218CACBDEVNJIT57L56TRVR6RRHBP (salt=4AB238F7CD74D23D, hash=1, iterations=50)
-
-$ nsec3hash  4C44934802D3 1 8 verisign.com.
-LVNT2DK6E38UB5HG27E7MCINT8M21C9P (salt=4C44934802D3, hash=1, iterations=8)
-
-"""
-
 import os
 import sys
 import hashlib
@@ -23,6 +8,13 @@ import dns.name
 
 b32_to_ext_hex = bytes.maketrans(b'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567',
                                  b'0123456789ABCDEFGHIJKLMNOPQRSTUV')
+
+TEST_VECTORS = [
+    [('9EBA4228', 1, 0, 'appforce.com.'), '8J1MO1GNFAB00QV63ROFSL7DBDQU0QN2'],
+    [('', 1, 0, 'com.'), 'CK0POJMG874LJREF7EFN8430QVIT8BSM'],
+    [('4C44934802D3', 1, 8, 'verisign.com.'), 'LVNT2DK6E38UB5HG27E7MCINT8M21C9P'],
+    [('4AB238F7CD74D23D', 1, 50, 'toshiba.com.'), '7QN218CACBDEVNJIT57L56TRVR6RRHBP'],
+]
 
 
 def usage():
@@ -68,7 +60,33 @@ def nsec3hash(name, algnum, salt, iterations, binary_out=False):
         return output
 
 
+def run_tests():
+    count = 0
+    passed = 0
+    print('Running tests ..')
+    for (data, hashvalue) in TEST_VECTORS:
+        count += 1
+        salt, algnum, iterations, name = data
+        out = nsec3hash(name, algnum, salt, iterations)
+        if out == hashvalue:
+            passed += 1
+            print('OK: ', end='')
+        else:
+            print('ERROR: ', end='')
+        print("{} {} {} {} = {}".format(
+            name, algnum, salt, iterations, out))
+    if passed == count:
+        print('\nOK: All tests passed.')
+        sys.exit(0)
+    else:
+        print('\nERROR: Not all tests passed.')
+        sys.exit(1)
+
+
 if __name__ == '__main__':
+
+    if len(sys.argv) == 2 and sys.argv[1] == 'test':
+        run_tests()
 
     if len(sys.argv) != 5:
         usage()
@@ -77,4 +95,3 @@ if __name__ == '__main__':
     algnum = int(algnum)
     iterations = int(iterations)
     print(nsec3hash(name, algnum, salt, iterations))
-
