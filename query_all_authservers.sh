@@ -2,16 +2,21 @@
 #
 
 RESOLVER=8.8.8.8             # For resolving current nameserver set
+DIGOPTS="+norecurse +time=2 +retry=2"
 
 progname=`basename $0`
 
 usage() {
     cat <<EOF
-Usage: $progname <zone> <record> <type>
+Usage: $progname [Options] <zone> <record> <type>
 
        <zone> :   name of the zone (force.com, my.salesforce.com etc)
        <record> : DNS record name (e.g. ap6.force.com)
        <type> :   DNS record type (e.g. A, CNAME, etc)
+
+	Options:
+	-4: Only query IPv4 addresses
+	-6: Only query IPv6 addresses
 
 e.g.
        $progname my.salesforce.com ap6.my.salesforce.com CNAME
@@ -38,18 +43,15 @@ RRTYPE=$3
 
 dig @$RESOLVER $ZONE NS +short | while read nsname
 do
-    ip4list=`dig +short $nsname A`
-    ip6list=`dig +short $nsname AAAA`
-    if [ "$TRANSPORT" = "-4" ]; then
-	iplist="$ip4list"
-    elif [ "$TRANSPORT" = "-6" ]; then
-	iplist="$ip6list"
-    elif [ "$TRANSPORT" = "" ]; then
-	iplist="$ip6list $ip4list"
+    if [ "$TRANSPORT" != "-6" ]; then
+	ip4list=`dig +short $nsname A`
     fi
-    for ip in $iplist
+    if [ "$TRANSPORT" != "-4" ]; then
+	ip6list=`dig +short $nsname AAAA`
+    fi
+    for ip in $ip6list $ip4list
     do
-	RESULT=`dig +norecurse $DIGOPTS @$ip $RECORD $RRTYPE +short | sort | tr '\n' ',' | sed 's:,$::'`
+	RESULT=`dig $DIGOPTS @$ip $RECORD $RRTYPE +short | sort | tr '\n' ',' | sed 's:,$::'`
 	echo "$RESULT	$nsname $ip"
     done
 done
