@@ -1,10 +1,6 @@
 #!/bin/sh
 #
 
-ZONE=$1
-RECORD=$2
-RRTYPE=$3
-
 RESOLVER=8.8.8.8             # For resolving current nameserver set
 
 progname=`basename $0`
@@ -27,18 +23,33 @@ EOF
     exit 1
 }
 
+if [ "$1" = "-4" -o "$1" = "-6" ]; then
+    TRANSPORT="$1"
+    shift
+fi
 
 if [ $# -ne 3 ]; then
     usage
 fi
 
+ZONE=$1
+RECORD=$2
+RRTYPE=$3
+
 dig @$RESOLVER $ZONE NS +short | while read nsname
 do
     ip4list=`dig +short $nsname A`
     ip6list=`dig +short $nsname AAAA`
-    for ip in $ip6list $ip4list
+    if [ "$TRANSPORT" = "-4" ]; then
+	iplist="$ip4list"
+    elif [ "$TRANSPORT" = "-6" ]; then
+	iplist="$ip6list"
+    elif [ "$TRANSPORT" = "" ]; then
+	iplist="$ip6list $ip4list"
+    fi
+    for ip in $iplist
     do
-	RESULT=`dig +norecurse $DIGOPTS @$nsname $RECORD $RRTYPE +short | sort | tr '\n' ',' | sed 's:,$::'`
+	RESULT=`dig +norecurse $DIGOPTS @$ip $RECORD $RRTYPE +short | sort | tr '\n' ',' | sed 's:,$::'`
 	echo "$RESULT	$nsname $ip"
     done
 done
