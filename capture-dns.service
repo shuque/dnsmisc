@@ -1,0 +1,26 @@
+#
+# A systemd service script to run a perpetual background tcpdump
+# process that captures DNS packets and fragments.
+#
+
+[Unit]
+Description=DNS Packet Capture (local)
+After=network.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=1s
+TimeoutSec=300
+#
+Environment=DEVICE=eth0
+Environment=SNAPLEN=0
+Environment=USERNAME=named
+Environment=OUTFILE=/usr/local/bind/capture/log.pcap
+Environment=NUMFILES=5
+Environment=FILESIZE=50
+#
+ExecStart=/usr/sbin/tcpdump -i ${DEVICE} -s ${SNAPLEN} -Z ${USERNAME} -w ${OUTFILE} -W ${NUMFILES} -C ${FILESIZE} "port 53 or (ip[6:2] & 0x1fff != 0) or (ip6[6] == 44)"
+
+[Install]
+WantedBy=multi-user.target
