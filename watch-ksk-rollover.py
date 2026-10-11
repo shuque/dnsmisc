@@ -2,29 +2,31 @@
 #
 
 """
-Monitor a root zone KSK rollover. Periodically query the root DNSKEY
-RRset directly at every root server address, and record when each one
-starts serving a DNSKEY RRset signed by the new KSK.
+Monitor a DNS zone KSK rollover. Periodically query the zone's DNSKEY
+RRset directly at every authoritative server address, and record when
+each one starts serving a DNSKEY RRset signed by the new KSK.
 
-Runs until interrupted with Control-C, then prints a summary.
+The zone defaults to the root zone. Runs until interrupted with
+Control-C, then prints a summary.
 
 How it works:
 
-  At startup, the root server names are obtained by querying ". NS"
-  via the system resolver, and their IPv4 and IPv6 addresses by
-  querying A and AAAA records for each name (-4 or -6 restricts this
-  to one address family). This list of (server name, address) targets
-  is fixed for the life of the program.
+  At startup, the zone's nameserver names are obtained by querying
+  "<zone> NS" via the system resolver, and their IPv4 and IPv6
+  addresses by querying A and AAAA records for each name (-4 or -6
+  restricts this to one address family). Nameserver names that fail
+  to resolve are reported and skipped. This list of (server name,
+  address) targets is fixed for the life of the program.
 
-  Every interval (-i, default 60 seconds), a ". DNSKEY" query is sent
-  to all targets in parallel. Queries are sent directly to the root
-  server addresses (not via a resolver) to avoid caching effects. Each
-  query has the RD (recursion desired) flag cleared, and uses EDNS0
-  with the DO (DNSSEC OK) bit set, a 1232 byte UDP payload size, and
-  an empty NSID option. UDP queries are retried on timeout, and are
-  retried over TCP if the response is truncated. The NSID returned in
-  the response identifies the particular anycast instance of the root
-  server that answered.
+  Every interval (-i, default 60 seconds), a "<zone> DNSKEY" query is
+  sent to all targets in parallel. Queries are sent directly to the
+  authoritative server addresses (not via a resolver) to avoid caching
+  effects. Each query has the RD (recursion desired) flag cleared, and
+  uses EDNS0 with the DO (DNSSEC OK) bit set, a 1232 byte UDP payload
+  size, and an empty NSID option. UDP queries are retried on timeout,
+  and are retried over TCP if the response is truncated. The NSID
+  returned in the response, if any, identifies the particular anycast
+  instance of the server that answered.
 
   From each response, the keytags of the RRSIG records covering the
   DNSKEY RRset are extracted, along with their inception and
@@ -39,8 +41,10 @@ How it works:
             an instance that has not yet loaded the newly signed zone.
     CHANGE  Any other change in the signing keytag set. For example,
             the appearance of a revoked old KSK's signature.
-    ERROR   Query timed out, failed, or returned a non-NOERROR rcode.
-            The target's tracked state is left unchanged.
+    ERROR   Query timed out, failed, returned a non-NOERROR rcode, or
+            returned a non-authoritative response (AA bit not set, e.g.
+            from a lame server). The target's tracked state is left
+            unchanged.
 
   After each round, a ROUND line reports how many targets are
   currently signed by the new KSK, and how many queries failed.
@@ -54,9 +58,14 @@ How it works:
   With -o FILE, every observation (one per target per round) is also
   appended to FILE as a JSON object per line, for later analysis.
 
-  The new KSK keytag defaults to 38696 (the root KSK that took over
-  from 20326 on 2026-10-11), and can be changed with -k for future
-  rollovers.
+  The keytag of the new KSK is specified with -k. For the root zone it
+  defaults to 38696 (the root KSK that took over from 20326 on
+  2026-10-11). For other zones, -k is required.
+
+  For multi-signer zones (RFC 8901), servers operated by different
+  providers may legitimately sign with different keys. Since each
+  target is tracked separately, the output remains meaningful, but the
+  ROUND count only reflects targets signed by the single new keytag.
 
 """
 
@@ -69,6 +78,7 @@ import concurrent.futures
 import dns.resolver
 import dns.query
 import dns.message
+import dns.name
 import dns.flags
 import dns.edns
 import dns.rdatatype
@@ -77,16 +87,17 @@ import dns.exception
 
 
 PROGNAME = os.path.basename(sys.argv[0])
-VERSION = "0.0.1"
+VERSION = "0.0.2"
 
 INTERVAL = 60
 TIMEOUT = 3
 RETRIES = 2
 EDNS_UDP_ADV = 1232
 
-OLD_KEYTAG = 20326
-NEW_KEYTAG = 38696
+ROOT_NEW_KEYTAG = 38696
 
+ZONE = "."
+NEW_KEYTAG = None
 IP_RRTYPES = [dns.rdatatype.AAAA, dns.rdatatype.A]
 OBSFILE = None
 ONESHOT = False
@@ -100,17 +111,20 @@ def usage(msg=None):
 
     print("""\
 {0} version {1}
-Usage: {0} [Options]
+Usage: {0} [Options] [zone]
+
+       zone defaults to the root zone (".")
 
        Options:
        -h          Print this help string
        -4          Use IPv4 transport only
        -6          Use IPv6 transport only
        -i N        Query interval in seconds (default: {2})
-       -k N        Keytag of new KSK (default: {3})
+       -k N        Keytag of new KSK (required, except for the root
+                   zone, where it defaults to {3})
        -o FILE     Append every observation to FILE as JSON lines
        -1          Run one round of queries and exit
-""".format(PROGNAME, VERSION, INTERVAL, NEW_KEYTAG)
+""".format(PROGNAME, VERSION, INTERVAL, ROOT_NEW_KEYTAG)
 )
     sys.exit(4)
 
@@ -118,15 +132,17 @@ Usage: {0} [Options]
 def process_args(arg_vector):
     """Process command line options and arguments"""
 
-    global IP_RRTYPES, INTERVAL, NEW_KEYTAG, OBSFILE, ONESHOT
+    global ZONE, IP_RRTYPES, INTERVAL, NEW_KEYTAG, OBSFILE, ONESHOT
 
     try:
         (options, args) = getopt.getopt(arg_vector, 'h46i:k:o:1')
     except getopt.GetoptError as exc_info:
         usage("{}".format(exc_info))
 
+    if len(args) > 1:
+        usage("At most one positional argument (zone) expected")
     if args:
-        usage("No positional arguments expected")
+        ZONE = dns.name.from_text(args[0]).to_text()
 
     for (opt, optval) in options:
         if opt == "-h":
@@ -144,6 +160,11 @@ def process_args(arg_vector):
         elif opt == "-1":
             ONESHOT = True
 
+    if NEW_KEYTAG is None:
+        if ZONE != ".":
+            usage("-k (new KSK keytag) is required for non-root zones")
+        NEW_KEYTAG = ROOT_NEW_KEYTAG
+
 
 def timestr(epoch):
     """Return UTC timestamp string for given epoch time"""
@@ -159,19 +180,28 @@ def tagstr(keytags):
     return ",".join(str(x) for x in keytags) or "NOSIG"
 
 
-def get_targets():
-    """Return sorted list of (nsname, ipaddress) for root servers"""
+def get_targets(zone):
+    """Return sorted list of (nsname, ipaddress) for zone's nameservers"""
 
     targets = []
-    msg = dns.resolver.resolve('.', dns.rdatatype.NS).response
+    try:
+        msg = dns.resolver.resolve(zone, dns.rdatatype.NS).response
+    except dns.exception.DNSException as exc_info:
+        sys.exit("{}: error: NS lookup for {} failed: {}".format(
+            PROGNAME, zone, exc_info))
     for rrset in msg.answer:
         if rrset.rdtype != dns.rdatatype.NS:
             continue
         for rdata in rrset:
             nsname = rdata.target.to_text()
             for rrtype in IP_RRTYPES:
-                answer = dns.resolver.resolve(nsname, rrtype,
-                                              raise_on_no_answer=False)
+                try:
+                    answer = dns.resolver.resolve(nsname, rrtype,
+                                                  raise_on_no_answer=False)
+                except dns.exception.DNSException as exc_info:
+                    print("WARN: {} {} lookup failed: {}".format(
+                        nsname, dns.rdatatype.to_text(rrtype), exc_info))
+                    continue
                 if answer.rrset is None:
                     continue
                 for ip in answer.rrset:
@@ -198,7 +228,7 @@ def send_query(msg, ipaddress):
 
 def query_dnskey(target):
     """
-    Query root DNSKEY at given target. Return dictionary describing
+    Query zone DNSKEY at given target. Return dictionary describing
     the observation: rcode, NSID, and keytags/inception/expiration of
     the RRSIG(s) covering the DNSKEY RRset.
     """
@@ -206,7 +236,7 @@ def query_dnskey(target):
     nsname, ipaddress = target
     obs = {'name': nsname, 'ip': ipaddress, 'timestamp': time.time()}
 
-    msg = dns.message.make_query('.', dns.rdatatype.DNSKEY,
+    msg = dns.message.make_query(ZONE, dns.rdatatype.DNSKEY,
                                  want_dnssec=True, use_edns=0,
                                  payload=EDNS_UDP_ADV,
                                  options=[dns.edns.GenericOption(
@@ -229,6 +259,10 @@ def query_dnskey(target):
                 getattr(option, 'data', b'')
             obs['nsid'] = data.decode(errors='replace')
 
+    if res.rcode() == dns.rcode.NOERROR and not res.flags & dns.flags.AA:
+        obs['error'] = "non-authoritative response (AA bit not set)"
+        return obs
+
     sigs = []
     for rrset in res.answer:
         if rrset.rdtype == dns.rdatatype.RRSIG and \
@@ -242,7 +276,7 @@ def query_dnskey(target):
 
 
 class TargetState:
-    """Tracked state of one root server address"""
+    """Tracked state of one nameserver address"""
 
     def __init__(self):
         self.keytags = None
@@ -291,18 +325,22 @@ def process_observation(obs, state):
 def print_summary(targets, states):
     """Print summary table of all targets"""
 
-    print("\nSummary (new KSK {}):".format(NEW_KEYTAG))
-    print("(\"<=\" means the new KSK was already present at program start)")
-    print("{:<22} {:<26} {:<12} {:<23} {}".format(
-        "Server", "Address", "Keytags", "First seen new KSK", "Reverts"))
+    rows = [("Server", "Address", "Keytags", "First seen new KSK",
+             "Reverts")]
     for target in targets:
         state = states[target]
         first_new = timestr(state.first_new) if state.first_new else "-"
         if state.new_at_start:
             first_new = "<=" + first_new
-        print("{:<22} {:<26} {:<12} {:<23} {}".format(
-            target[0], target[1], tagstr(state.keytags),
-            first_new, state.reverts))
+        rows.append((target[0], target[1], tagstr(state.keytags),
+                     first_new, str(state.reverts)))
+    widths = [max(len(row[i]) for row in rows) for i in range(4)]
+
+    print("\nSummary for zone {} (new KSK {}):".format(ZONE, NEW_KEYTAG))
+    print("(\"<=\" means the new KSK was already present at program start)")
+    for row in rows:
+        print("  ".join(col.ljust(width)
+                        for col, width in zip(row, widths)) + "  " + row[4])
 
 
 def run_round(executor, targets, states, obsfile, roundnum):
@@ -329,12 +367,15 @@ def run_round(executor, targets, states, obsfile, roundnum):
 def main():
     """main function"""
 
-    targets = get_targets()
+    targets = get_targets(ZONE)
+    if not targets:
+        sys.exit("{}: error: no nameserver addresses found for {}".format(
+            PROGNAME, ZONE))
     states = {x: TargetState() for x in targets}
     obsfile = open(OBSFILE, 'a') if OBSFILE else None
 
-    print("Monitoring {} root server addresses every {}s for new KSK {}".format(
-        len(targets), INTERVAL, NEW_KEYTAG))
+    print("Monitoring {} nameserver addresses for zone {} every {}s "
+          "for new KSK {}".format(len(targets), ZONE, INTERVAL, NEW_KEYTAG))
 
     roundnum = 0
     try:
