@@ -2,9 +2,14 @@
 #
 
 """
-Monitor a DNS zone KSK rollover. Periodically query the zone's DNSKEY
-RRset directly at every authoritative server address, and record when
-each one starts serving a DNSKEY RRset signed by the new KSK.
+Monitor a DNSSEC key rollover (KSK or ZSK) for a DNS zone. Periodically
+query an RRset at the zone apex directly at every authoritative server
+address, and record changes in the set of keys signing that RRset.
+
+By default the DNSKEY RRset is queried, whose signatures are made by
+the KSK, so this tracks KSK rollovers. To track ZSK rollovers, use
+"-t SOA", since the apex SOA RRset is always present and is signed by
+the ZSK. (For zones using a single Combined Signing Key, either works.)
 
 The zone defaults to the root zone. Runs until interrupted with
 Control-C, then prints a summary.
@@ -18,54 +23,68 @@ How it works:
   to resolve are reported and skipped. This list of (server name,
   address) targets is fixed for the life of the program.
 
-  Every interval (-i, default 60 seconds), a "<zone> DNSKEY" query is
-  sent to all targets in parallel. Queries are sent directly to the
-  authoritative server addresses (not via a resolver) to avoid caching
-  effects. Each query has the RD (recursion desired) flag cleared, and
-  uses EDNS0 with the DO (DNSSEC OK) bit set, a 1232 byte UDP payload
-  size, and an empty NSID option. UDP queries are retried on timeout,
-  and are retried over TCP if the response is truncated. The NSID
-  returned in the response, if any, identifies the particular anycast
-  instance of the server that answered.
+  Every interval (-i, default 60 seconds), a "<zone> <type>" query
+  (type set by -t, default DNSKEY) is sent to all targets in parallel.
+  Queries are sent directly to the authoritative server addresses (not
+  via a resolver) to avoid caching effects. Each query has the RD
+  (recursion desired) flag cleared, and uses EDNS0 with the DO (DNSSEC
+  OK) bit set, a 1232 byte UDP payload size, and an empty NSID option.
+  UDP queries are retried on timeout, and are retried over TCP if the
+  response is truncated. The NSID returned in the response, if any,
+  identifies the particular anycast instance of the server that
+  answered.
 
   From each response, the keytags of the RRSIG records covering the
-  DNSKEY RRset are extracted, along with their inception and
-  expiration times. The program tracks the most recently seen set of
-  signing keytags for each target, and prints a line only when that
-  set changes. Each line is labelled with one of these events:
+  queried RRset are extracted, along with their inception and
+  expiration times. For SOA queries, the SOA serial number is also
+  recorded. The program tracks the most recently seen set of signing
+  keytags for each target, and prints a line only when that set
+  changes. Each line is labelled with one of these events:
 
     INIT    First observation of this target
-    NEWKSK  First time this target has been seen signed by the new KSK
-    REVERT  Target was signed by the new KSK, but no longer is. This
-            can happen with anycast, when routing shifts the queries to
-            an instance that has not yet loaded the newly signed zone.
-    CHANGE  Any other change in the signing keytag set. For example,
-            the appearance of a revoked old KSK's signature.
+    NEWKEY  First time this target has been seen signed by the new key
+            (only with -k)
+    REVERT  Target was signed by the new key, but no longer is (only
+            with -k). This can happen with anycast, when routing shifts
+            the queries to an instance that has not yet loaded the
+            newly signed zone.
+    CHANGE  Any other change in the signing keytag set. Without -k,
+            all changes after INIT are reported as CHANGE.
     ERROR   Query timed out, failed, returned a non-NOERROR rcode, or
             returned a non-authoritative response (AA bit not set, e.g.
             from a lame server). The target's tracked state is left
             unchanged.
 
-  After each round, a ROUND line reports how many targets are
-  currently signed by the new KSK, and how many queries failed.
+  After each round, a ROUND line reports the distribution of signing
+  keytag sets across all targets (e.g. "12345: 10, 54321: 3"), and how
+  many queries failed. With -k, it also reports how many targets are
+  currently signed by the new key.
 
   When interrupted with Control-C, a summary table is printed showing
-  each target's current signing keytags, the time it was first seen
-  signed by the new KSK, and the number of reverts. A first seen time
-  prefixed with "<=" means the new KSK was already present when the
+  each target's current signing keytags (and SOA serial, for SOA
+  queries). With -k, it also shows the time each target was first seen
+  signed by the new key, and the number of reverts. A first seen time
+  prefixed with "<=" means the new key was already present when the
   program started, so the actual changeover happened at or before it.
 
   With -o FILE, every observation (one per target per round) is also
   appended to FILE as a JSON object per line, for later analysis.
 
-  The keytag of the new KSK is specified with -k. For the root zone it
-  defaults to 38696 (the root KSK that took over from 20326 on
-  2026-10-11). For other zones, -k is required.
+  The keytag of the new key (-k) is optional. It is often not known in
+  advance, for example when a DNS provider rolls ZSKs routinely, and
+  without it the ROUND line distribution still shows the progress of
+  a rollover.
+
+  Note on ZSK rollovers: signers that re-sign incrementally replace
+  signatures gradually over the signature validity period, so the SOA
+  RRset being signed by a new ZSK does not mean the whole zone has
+  been re-signed with it. Since the SOA is re-signed on every serial
+  change, it is typically among the first RRsets to switch, making it
+  a good early indicator, but only a proxy for the whole zone.
 
   For multi-signer zones (RFC 8901), servers operated by different
   providers may legitimately sign with different keys. Since each
-  target is tracked separately, the output remains meaningful, but the
-  ROUND count only reflects targets signed by the single new keytag.
+  target is tracked separately, the output remains meaningful.
 
 """
 
@@ -74,6 +93,7 @@ import sys
 import getopt
 import json
 import time
+import collections
 import concurrent.futures
 import dns.resolver
 import dns.query
@@ -87,16 +107,15 @@ import dns.exception
 
 
 PROGNAME = os.path.basename(sys.argv[0])
-VERSION = "0.0.2"
+VERSION = "0.0.3"
 
 INTERVAL = 60
 TIMEOUT = 3
 RETRIES = 2
 EDNS_UDP_ADV = 1232
 
-ROOT_NEW_KEYTAG = 38696
-
 ZONE = "."
+QTYPE = dns.rdatatype.DNSKEY
 NEW_KEYTAG = None
 IP_RRTYPES = [dns.rdatatype.AAAA, dns.rdatatype.A]
 OBSFILE = None
@@ -119,12 +138,13 @@ Usage: {0} [Options] [zone]
        -h          Print this help string
        -4          Use IPv4 transport only
        -6          Use IPv6 transport only
+       -t TYPE     RRset type whose signatures to track (default: DNSKEY,
+                   for KSK rolls; use SOA for ZSK rolls)
+       -k N        Keytag of new key (optional)
        -i N        Query interval in seconds (default: {2})
-       -k N        Keytag of new KSK (required, except for the root
-                   zone, where it defaults to {3})
        -o FILE     Append every observation to FILE as JSON lines
        -1          Run one round of queries and exit
-""".format(PROGNAME, VERSION, INTERVAL, ROOT_NEW_KEYTAG)
+""".format(PROGNAME, VERSION, INTERVAL)
 )
     sys.exit(4)
 
@@ -132,10 +152,10 @@ Usage: {0} [Options] [zone]
 def process_args(arg_vector):
     """Process command line options and arguments"""
 
-    global ZONE, IP_RRTYPES, INTERVAL, NEW_KEYTAG, OBSFILE, ONESHOT
+    global ZONE, QTYPE, IP_RRTYPES, INTERVAL, NEW_KEYTAG, OBSFILE, ONESHOT
 
     try:
-        (options, args) = getopt.getopt(arg_vector, 'h46i:k:o:1')
+        (options, args) = getopt.getopt(arg_vector, 'h46t:k:i:o:1')
     except getopt.GetoptError as exc_info:
         usage("{}".format(exc_info))
 
@@ -151,19 +171,19 @@ def process_args(arg_vector):
             IP_RRTYPES = [dns.rdatatype.A]
         elif opt == "-6":
             IP_RRTYPES = [dns.rdatatype.AAAA]
-        elif opt == "-i":
-            INTERVAL = int(optval)
+        elif opt == "-t":
+            try:
+                QTYPE = dns.rdatatype.from_text(optval.upper())
+            except dns.rdatatype.UnknownRdatatype:
+                usage("Unknown RR type: {}".format(optval))
         elif opt == "-k":
             NEW_KEYTAG = int(optval)
+        elif opt == "-i":
+            INTERVAL = int(optval)
         elif opt == "-o":
             OBSFILE = optval
         elif opt == "-1":
             ONESHOT = True
-
-    if NEW_KEYTAG is None:
-        if ZONE != ".":
-            usage("-k (new KSK keytag) is required for non-root zones")
-        NEW_KEYTAG = ROOT_NEW_KEYTAG
 
 
 def timestr(epoch):
@@ -226,17 +246,18 @@ def send_query(msg, ipaddress):
     return res
 
 
-def query_dnskey(target):
+def query_sigs(target):
     """
-    Query zone DNSKEY at given target. Return dictionary describing
-    the observation: rcode, NSID, and keytags/inception/expiration of
-    the RRSIG(s) covering the DNSKEY RRset.
+    Query zone apex RRset of type QTYPE at given target. Return
+    dictionary describing the observation: rcode, NSID, keytags/
+    inception/expiration of the RRSIG(s) covering the RRset, and the
+    serial number for SOA queries.
     """
 
     nsname, ipaddress = target
     obs = {'name': nsname, 'ip': ipaddress, 'timestamp': time.time()}
 
-    msg = dns.message.make_query(ZONE, dns.rdatatype.DNSKEY,
+    msg = dns.message.make_query(ZONE, QTYPE,
                                  want_dnssec=True, use_edns=0,
                                  payload=EDNS_UDP_ADV,
                                  options=[dns.edns.GenericOption(
@@ -265,9 +286,10 @@ def query_dnskey(target):
 
     sigs = []
     for rrset in res.answer:
-        if rrset.rdtype == dns.rdatatype.RRSIG and \
-           rrset.covers == dns.rdatatype.DNSKEY:
+        if rrset.rdtype == dns.rdatatype.RRSIG and rrset.covers == QTYPE:
             sigs.extend(rrset)
+        elif rrset.rdtype == dns.rdatatype.SOA and QTYPE == dns.rdatatype.SOA:
+            obs['serial'] = rrset[0].serial
     sigs.sort(key=lambda x: x.key_tag)
     obs['keytags'] = [x.key_tag for x in sigs]
     obs['inception'] = [timestr(x.inception) for x in sigs]
@@ -280,9 +302,24 @@ class TargetState:
 
     def __init__(self):
         self.keytags = None
+        self.serial = None
         self.first_new = None
         self.new_at_start = False
         self.reverts = 0
+
+
+def classify_change(state, keytags):
+    """Return event label for a change in target's signing keytags"""
+
+    if state.keytags is None:
+        return "INIT"
+    if NEW_KEYTAG is None:
+        return "CHANGE"
+    if NEW_KEYTAG in keytags and state.first_new is None:
+        return "NEWKEY"
+    if NEW_KEYTAG in state.keytags and NEW_KEYTAG not in keytags:
+        return "REVERT"
+    return "CHANGE"
 
 
 def process_observation(obs, state):
@@ -298,55 +335,65 @@ def process_observation(obs, state):
         print("{} ERROR  {} rcode {}".format(ts, desc, obs['rcode']))
         return
 
+    state.serial = obs.get('serial')
     keytags = tuple(obs['keytags'])
     if keytags == state.keytags:
         return
 
-    has_new = NEW_KEYTAG in keytags
-    if state.keytags is None:
-        event = "INIT  "
-        state.new_at_start = has_new
-    elif has_new and state.first_new is None:
-        event = "NEWKSK"
-    elif NEW_KEYTAG in state.keytags and not has_new:
-        event = "REVERT"
+    event = classify_change(state, keytags)
+    if NEW_KEYTAG is not None and NEW_KEYTAG in keytags:
+        if event == "INIT":
+            state.new_at_start = True
+        if state.first_new is None:
+            state.first_new = obs['timestamp']
+    if event == "REVERT":
         state.reverts += 1
-    else:
-        event = "CHANGE"
-    if has_new and state.first_new is None:
-        state.first_new = obs['timestamp']
 
-    print("{} {} {} {} -> {} (inception {})".format(
-        ts, event, desc, tagstr(state.keytags), tagstr(keytags),
-        ",".join(obs['inception'])))
+    details = "inception {}".format(",".join(obs['inception']))
+    if 'serial' in obs:
+        details = "serial {}, {}".format(obs['serial'], details)
+    print("{} {:<6} {} {} -> {} ({})".format(
+        ts, event, desc, tagstr(state.keytags), tagstr(keytags), details))
     state.keytags = keytags
 
 
 def print_summary(targets, states):
     """Print summary table of all targets"""
 
-    rows = [("Server", "Address", "Keytags", "First seen new KSK",
-             "Reverts")]
+    header = ["Server", "Address", "Keytags"]
+    if QTYPE == dns.rdatatype.SOA:
+        header.append("Serial")
+    if NEW_KEYTAG is not None:
+        header.extend(["First seen new key", "Reverts"])
+
+    rows = [header]
     for target in targets:
         state = states[target]
-        first_new = timestr(state.first_new) if state.first_new else "-"
-        if state.new_at_start:
-            first_new = "<=" + first_new
-        rows.append((target[0], target[1], tagstr(state.keytags),
-                     first_new, str(state.reverts)))
-    widths = [max(len(row[i]) for row in rows) for i in range(4)]
+        row = [target[0], target[1], tagstr(state.keytags)]
+        if QTYPE == dns.rdatatype.SOA:
+            row.append(str(state.serial) if state.serial is not None else "-")
+        if NEW_KEYTAG is not None:
+            first_new = timestr(state.first_new) if state.first_new else "-"
+            if state.new_at_start:
+                first_new = "<=" + first_new
+            row.extend([first_new, str(state.reverts)])
+        rows.append(row)
+    widths = [max(len(row[i]) for row in rows) for i in range(len(header))]
 
-    print("\nSummary for zone {} (new KSK {}):".format(ZONE, NEW_KEYTAG))
-    print("(\"<=\" means the new KSK was already present at program start)")
+    print("\nSummary for zone {} RRSIG({}){}:".format(
+        ZONE, dns.rdatatype.to_text(QTYPE),
+        " new key {}".format(NEW_KEYTAG) if NEW_KEYTAG is not None else ""))
+    if NEW_KEYTAG is not None:
+        print("(\"<=\" means the new key was already present at program start)")
     for row in rows:
         print("  ".join(col.ljust(width)
-                        for col, width in zip(row, widths)) + "  " + row[4])
+                        for col, width in zip(row, widths)).rstrip())
 
 
 def run_round(executor, targets, states, obsfile, roundnum):
     """Query all targets once, and process the results"""
 
-    observations = list(executor.map(query_dnskey, targets))
+    observations = list(executor.map(query_sigs, targets))
     for obs in observations:
         process_observation(obs, states[(obs['name'], obs['ip'])])
         if obsfile:
@@ -354,13 +401,19 @@ def run_round(executor, targets, states, obsfile, roundnum):
     if obsfile:
         obsfile.flush()
 
-    count_new = sum(1 for x in states.values()
-                    if x.keytags and NEW_KEYTAG in x.keytags)
+    counts = collections.Counter(tagstr(x.keytags) for x in states.values())
+    distribution = ", ".join("{}: {}".format(tags, count)
+                             for tags, count in sorted(counts.items()))
     count_err = sum(1 for x in observations
                     if 'error' in x or x['rcode'] != 'NOERROR')
-    print("{} ROUND {}: {}/{} signed by {} (errors: {})".format(
-        timestr(time.time()), roundnum, count_new, len(targets),
-        NEW_KEYTAG, count_err))
+    newkey_info = ""
+    if NEW_KEYTAG is not None:
+        count_new = sum(1 for x in states.values()
+                        if x.keytags and NEW_KEYTAG in x.keytags)
+        newkey_info = "{}/{} signed by {}; ".format(
+            count_new, len(targets), NEW_KEYTAG)
+    print("{} ROUND {}: {}keytags {} (errors: {})".format(
+        timestr(time.time()), roundnum, newkey_info, distribution, count_err))
     sys.stdout.flush()
 
 
@@ -374,8 +427,11 @@ def main():
     states = {x: TargetState() for x in targets}
     obsfile = open(OBSFILE, 'a') if OBSFILE else None
 
-    print("Monitoring {} nameserver addresses for zone {} every {}s "
-          "for new KSK {}".format(len(targets), ZONE, INTERVAL, NEW_KEYTAG))
+    print("Monitoring {} nameserver addresses for zone {} RRSIG({}) "
+          "every {}s{}".format(
+              len(targets), ZONE, dns.rdatatype.to_text(QTYPE), INTERVAL,
+              ", new key {}".format(NEW_KEYTAG)
+              if NEW_KEYTAG is not None else ""))
 
     roundnum = 0
     try:
